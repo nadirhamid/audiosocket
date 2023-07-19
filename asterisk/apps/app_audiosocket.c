@@ -45,6 +45,7 @@
 #include "asterisk/res_audiosocket.h"
 #include "asterisk/utils.h"
 #include "asterisk/format_cache.h"
+#include "asterisk/audiohook.h"
 #include "asterisk/autochan.h"
 
 #define AUDIOSOCKET_CONFIG "audiosocket.conf"
@@ -72,30 +73,158 @@
  ***/
 
 static const char app[] = "AudioSocket";
+static const char *const audiosocket_spy_type = "AudioSocket";
 
 struct audiosocket_data {
-	char* server;
-	char* idStr;
+	enum ast_audiohook_direction direction;
+	struct ast_audiohook audiohook;
 	ast_callid callid;
 	struct ast_autochan *autochan;
+	struct audiosocket_ds *audiosocket_ds;
+	int samples_per_frame;
+	char *server;
+	char *idStr;
+
+
 };
 
-static int audiosocket_run(struct ast_channel *chan, const char *id, const int svc);
+struct audiosocket_ds {
+	ast_callid callid;
+	unsigned int destruction_ok;
+	ast_cond_t destruction_condition;
+	ast_mutex_t lock;
+	char *server;
+	char *idStr;
+
+	unsigned int samp_rate;
+	struct ast_audiohook *audiohook;
+};
+
+static void audiosocket_ds_destroy(void *data)
+{
+	struct audiosocket_ds *audiosocket_ds = data;
+
+	ast_mutex_lock(&audiosocket_ds->lock);
+	audiosocket_ds->audiohook = NULL;
+	audiosocket_ds->destruction_ok = 1;
+	ast_free(audiosocket_ds->server);
+	ast_free(audiosocket_ds->idStr);
+	ast_cond_signal(&audiosocket_ds->destruction_condition);
+	ast_mutex_unlock(&audiosocket_ds->lock);
+}
+
+static const struct ast_datastore_info audiosocket_ds_info = {
+	.type = "audiosocket",
+	.destroy = audiosocket_ds_destroy,
+};
+
+static int audiosocket_run(struct ast_channel *chan, struct audiosocket_data *audiosocket_data, const int svc);
+
+static void audiosocket_destroy(void *data)
+{
+	struct audiosocket_ds *audiosocket_ds = data;
+
+	ast_mutex_lock(&audiosocket_ds->lock);
+	audiosocket_ds->audiohook = NULL;
+	audiosocket_ds->destruction_ok = 1;
+	ast_free(audiosocket_ds->server);
+	ast_free(audiosocket_ds->idStr);
+	ast_cond_signal(&audiosocket_ds->destruction_condition);
+	ast_mutex_unlock(&audiosocket_ds->lock);
+}
+
+static int setup_audiosocket_ds(struct audiosocket_data *audiosocket_data, struct ast_channel *chan, char **datastore_id)
+{
+	struct ast_datastore *datastore = NULL;
+	struct audiosocket_ds *audiosocket_ds;
+
+	if (!(audiosocket_ds = ast_calloc(1, sizeof(*audiosocket_ds)))) {
+		return -1;
+	}
+
+	if (ast_asprintf(datastore_id, "%p", audiosocket_ds) == -1) {
+		ast_log(LOG_ERROR, "Failed to allocate memory for Audiosocket ID.\n");
+		ast_free(audiosocket_ds);
+		return -1;
+	}
+
+	ast_mutex_init(&audiosocket_ds->lock);
+	ast_cond_init(&audiosocket_ds->destruction_condition, NULL);
+
+	if (!(datastore = ast_datastore_alloc(&audiosocket_ds_info, *datastore_id))) {
+		ast_mutex_destroy(&audiosocket_ds->lock);
+		ast_cond_destroy(&audiosocket_ds->destruction_condition);
+		ast_free(audiosocket_ds);
+		return -1;
+	}
+
+	audiosocket_ds->samp_rate = 8000;
+	audiosocket_ds->audiohook = &audiosocket_data->audiohook;
+	audiosocket_ds->server = ast_strdup(audiosocket_data->server);
+	audiosocket_ds->idStr = ast_strdup(audiosocket_data->idStr);
+	datastore->data = audiosocket_ds;
+
+	ast_channel_lock(chan);
+	ast_channel_datastore_add(chan, datastore);
+	ast_channel_unlock(chan);
+
+	audiosocket_data->audiosocket_ds = audiosocket_ds;
+	return 0;
+}
+
+static void destroy_monitor_audiohook(struct audiosocket_data *audiosocket_data)
+{
+	if (audiosocket_data->audiosocket_ds) {
+		ast_mutex_lock(&audiosocket_data->audiosocket_ds->lock);
+		audiosocket_data->audiosocket_ds->audiohook = NULL;
+		ast_mutex_unlock(&audiosocket_data->audiosocket_ds->lock);
+	}
+	/* kill the audiohook. */
+	ast_audiohook_lock(&audiosocket_data->audiohook);
+	ast_audiohook_detach(&audiosocket_data->audiohook);
+	ast_audiohook_unlock(&audiosocket_data->audiohook);
+	ast_audiohook_destroy(&audiosocket_data->audiohook);
+}
+
+static int start_audiohook(struct ast_channel *chan, struct ast_audiohook *audiohook)
+{
+	if (!chan) {
+		return -1;
+	}
+
+	return ast_audiohook_attach(chan, audiohook);
+}
+
+static void audiosocket_free(struct audiosocket_data *audiosocket_data)
+{
+	if (audiosocket_data) {
+		if (audiosocket_data->audiosocket_ds) {
+			ast_mutex_destroy(&audiosocket_data->audiosocket_ds->lock);
+			ast_cond_destroy(&audiosocket_data->audiosocket_ds->destruction_condition);
+			ast_free(audiosocket_data->audiosocket_ds);
+		}
+
+		ast_free(audiosocket_data->server);
+		ast_free(audiosocket_data->idStr);
+		ast_free(audiosocket_data);
+	}
+}
 
 static void *audiosocket_thread(void *obj)
 {
-	struct audiosocket_data *audiosocket_ds = obj;
-	struct ast_channel *chan = audiosocket_ds->autochan->chan;
-
+	struct ast_format *format_slin;
+	struct audiosocket_data *audiosocket_data = obj;
+	struct ast_channel *chan = audiosocket_data->autochan->chan;
 
 	int s = 0;
 	struct ast_format *readFormat, *writeFormat;
-	const char *chanName =  ast_channel_name(audiosocket_ds->autochan->chan);
+	char *datastore_id = NULL;
+	const char *chanName =  ast_channel_name(audiosocket_data->autochan->chan);
 	int res;
 
 	ast_module_unref(ast_module_info->self);
 
-	if ((s = ast_audiosocket_connect(audiosocket_ds->server, chan)) < 0) {
+	if ((s = ast_audiosocket_connect(audiosocket_data->server, chan)) < 0) {
 		/* The res module will already output a log message, so another is not needed */
 		ast_log(LOG_ERROR, "Could not connect to audiosocket server\n");
 		return 0;
@@ -124,7 +253,15 @@ static void *audiosocket_thread(void *obj)
 		return -1;
 	}
 
-	res = audiosocket_run(chan, audiosocket_ds->idStr, s);
+	if (setup_audiosocket_ds(audiosocket_data, chan, &datastore_id)) {
+		ast_autochan_destroy(audiosocket_data->autochan);
+		audiosocket_free(audiosocket_data);
+		ast_free(datastore_id);
+		return -1;
+	}
+
+	ast_verb(2, "setup audiosocket ds successfully. server = %s direction = %d\n", audiosocket_data->server, audiosocket_data->direction);
+	res = audiosocket_run(chan, audiosocket_data, s);
 	/* On non-zero return, report failure */
 	if (res) {
 		/* Restore previous formats and close the connection */
@@ -157,21 +294,38 @@ static void *audiosocket_thread(void *obj)
 
 static int launch_audiosocket_thread(struct ast_channel *chan, char* server, char* idStr) {
 	pthread_t thread;
-	struct audiosocket *audiosocket;
-	struct audiosocket_data *audiosocket_ds;
-	if (!(audiosocket_ds = ast_calloc(1, sizeof(*audiosocket_ds)))) {
+	struct audiosocket_data *audiosocket_data;
+	if (!(audiosocket_data = ast_calloc(1, sizeof(*audiosocket_data)))) {
 		return -1;
 	}
 	ast_verb(2, "Starting audiosocket thread\n");
-	audiosocket_ds->callid = ast_read_threadstorage_callid();
-	audiosocket_ds->server = ast_strdup( server );
-	audiosocket_ds->idStr = ast_strdup( idStr );
-	if (!(audiosocket_ds->autochan = ast_autochan_setup(chan))) {
+	audiosocket_data->callid = ast_read_threadstorage_callid();
+	audiosocket_data->server = ast_strdup( server );
+	audiosocket_data->idStr = ast_strdup( idStr );
+	audiosocket_data->samples_per_frame = 160;
+	audiosocket_data->direction = AST_AUDIOHOOK_DIRECTION_BOTH;
+
+	if (!(audiosocket_data->autochan = ast_autochan_setup(chan))) {
+		audiosocket_free(audiosocket_data);
 		return -1;
 	}
 
-	ast_verb(2, "Connection params server=%s idStr=%s\n", audiosocket_ds->server, audiosocket_ds->idStr);
-	return ast_pthread_create_detached_background(&thread, NULL, audiosocket_thread, audiosocket_ds);
+	// create an audiohook
+	if (ast_audiohook_init(&audiosocket_data->audiohook, AST_AUDIOHOOK_TYPE_SPY, audiosocket_spy_type, 0)) {
+		audiosocket_free(audiosocket_data);
+		return -1;
+	}
+
+	if (start_audiohook(chan, &audiosocket_data->audiohook)) {
+		ast_log(LOG_WARNING, "<%s> [Audiosocket] Unable to add audiohook type '%s'\n", ast_channel_name(chan), audiosocket_spy_type);
+		ast_audiohook_destroy(&audiosocket_data->audiohook);
+		audiosocket_free(audiosocket_data);
+		return -1;
+	}
+
+	ast_verb(2, "<%s> [Audiosocket] Added AudioHook\n", ast_channel_name(chan));
+	ast_verb(2, "Connection params server=%s idStr=%s direction=%d\n", audiosocket_data->server, audiosocket_data->idStr, audiosocket_data->direction);
+	return ast_pthread_create_detached_background(&thread, NULL, audiosocket_thread, audiosocket_data);
 }
 
 static int audiosocket_exec(struct ast_channel *chan, const char *data)
@@ -211,26 +365,102 @@ static int audiosocket_exec(struct ast_channel *chan, const char *data)
 	return 0;
 }
 
-static int audiosocket_run(struct ast_channel *chan, const char *id, int svc)
+static int audiosocket_run(struct ast_channel *chan, struct audiosocket_data *audiosocket_data, int svc)
 {
 	const char *chanName;
+	struct ast_format *format_slin;
 
 	if (!chan || ast_channel_state(chan) != AST_STATE_UP) {
 		return -1;
 	}
 
+	const char* id = audiosocket_data->idStr;
 	if (ast_audiosocket_init(svc, id)) {
 		return -1;
 	}
 
 	chanName = ast_channel_name(chan);
+	ast_verb(2, "audiosocket_run was called");
+	ast_mutex_lock(&audiosocket_data->audiosocket_ds->lock);
+	format_slin = ast_format_cache_get_slin_by_rate(audiosocket_data->audiosocket_ds->samp_rate);
+	ast_mutex_unlock(&audiosocket_data->audiosocket_ds->lock);
 
+	//ast_audiohook_lock(&audiosocket_data->audiohook);
+	while (audiosocket_data->audiohook.status == AST_AUDIOHOOK_STATUS_RUNNING) {
+		struct ast_channel *targetChan;
+		int ms = 0;
+		int outfd = 0;
+		struct ast_frame *sockfr;
+
+		/*
+		struct ast_frame *fr = ast_audiohook_read_frame(&audiosocket_data->audiohook, audiosocket_data->samples_per_frame, audiosocket_data->direction, format_slin);
+
+		if (!fr) {
+			ast_audiohook_trigger_wait(&audiosocket_data->audiohook);
+
+			if (audiosocket_data->audiohook.status != AST_AUDIOHOOK_STATUS_RUNNING) {
+				ast_verb(2, "<%s> [Audiosocket] AST_AUDIOHOOK_STATUS_RUNNING = 0\n", ast_channel_name(audiosocket_data->autochan->chan));
+				break;
+			}
+
+			continue;
+		}
+
+		//ast_audiohook_unlock(&audiosocket_data->audiohook);
+		if (fr->frametype == AST_FRAME_VOICE) {
+			// Send audio frame to audiosocket
+			ast_verb(4, "sending audio frame\n");
+			struct ast_frame *cur;
+
+			ast_mutex_lock(&audiosocket_data->audiosocket_ds->lock);
+			for (cur = fr; cur; cur = AST_LIST_NEXT(cur, frame_list)) {
+				if (ast_audiosocket_send_frame(svc, fr)) {
+					ast_log(LOG_ERROR, "Failed to forward channel frame from %s to AudioSocket\n",
+						chanName);
+					return -1;
+				}
+			}
+			ast_mutex_unlock(&audiosocket_data->audiosocket_ds->lock);
+		}
+		if (fr) {
+			ast_frame_free(fr, 0);
+		}
+		*/
+
+		// read from Audiosocket
+		if (outfd >= 0) {
+			ast_mutex_lock(&audiosocket_data->audiosocket_ds->lock);
+			//ast_audiohook_lock(&audiosocket_data->audiohook);
+			sockfr = ast_audiosocket_receive_frame(svc);
+			if (!sockfr) {
+				ast_log(LOG_ERROR, "Failed to receive frame from AudioSocket message for"
+					"channel %s\n", chanName);
+				continue;
+			}
+			//ast_audiohook_write_list(chan, ast_channel_audiohooks(chan), AST_AUDIOHOOK_DIRECTION_WRITE, sockfr);
+			if (ast_write(chan, sockfr)) {
+				ast_log(LOG_WARNING, "Failed to forward frame to channel %s\n", chanName);
+				ast_frfree(sockfr);
+				continue;
+			}
+
+			ast_frfree(sockfr);
+			//ast_audiohook_unlock(&audiosocket_data->audiohook);
+			ast_mutex_unlock(&audiosocket_data->audiosocket_ds->lock);
+		}
+
+		//ast_audiohook_lock(&audiosocket_data->audiohook);
+	}
+
+
+/*
 	while (1) {
 		struct ast_channel *targetChan;
 		int ms = 0;
 		int outfd = 0;
 		struct ast_frame *f;
 
+		continue;
 		targetChan = ast_waitfor_nandfds(&chan, 1, &svc, 1, NULL, &outfd, &ms);
 		if (targetChan) {
 			f = ast_read(chan);
@@ -239,7 +469,7 @@ static int audiosocket_run(struct ast_channel *chan, const char *id, int svc)
 			}
 
 			if (f->frametype == AST_FRAME_VOICE) {
-				/* Send audio frame to audiosocket */
+				// Send audio frame to audiosocket
 				if (ast_audiosocket_send_frame(svc, f)) {
 					ast_log(LOG_ERROR, "Failed to forward channel frame from %s to AudioSocket\n",
 						chanName);
@@ -265,6 +495,7 @@ static int audiosocket_run(struct ast_channel *chan, const char *id, int svc)
 			ast_frfree(f);
 		}
 	}
+	*/
 	return 0;
 }
 
