@@ -49,6 +49,7 @@
 
 #define AUDIOSOCKET_CONFIG "audiosocket.conf"
 #define MAX_CONNECT_TIMEOUT_MSEC 2000
+#define AUDIOPROCESS_USLEEP 5000
 
 /*** DOCUMENTATION
 	<application name="AudioSocket" language="en_US">
@@ -81,6 +82,23 @@ struct audiosocket_data {
 };
 
 static int audiosocket_run(struct ast_channel *chan, const char *id, const int svc);
+
+const int ast_audiosocket_heartbeat(const int svc)
+{
+	uuid_t uu;
+	int ret = 0;
+	uint8_t buf[3];
+	buf[0] = 0x11;
+	buf[1] = 0x00;
+	buf[2] = 0x10;
+
+	if (write(svc, buf, 3) != 3) {
+		ast_log(LOG_WARNING, "Failed to get heartbeat response from audiosocket\n");
+		ret = -1;
+	}
+
+	return ret;
+}
 
 static void *audiosocket_thread(void *obj)
 {
@@ -124,6 +142,7 @@ static void *audiosocket_thread(void *obj)
 		return -1;
 	}
 
+	ast_verb(2, "calling audiosocket_run");
 	res = audiosocket_run(chan, audiosocket_ds->idStr, s);
 	/* On non-zero return, report failure */
 	if (res) {
@@ -215,24 +234,53 @@ static int audiosocket_run(struct ast_channel *chan, const char *id, int svc)
 {
 	const char *chanName;
 
+	ast_verb(2, "processing audiosocket_run");
 	if (!chan || ast_channel_state(chan) != AST_STATE_UP) {
 		return -1;
 	}
 
+	ast_verb(2, "initializing audiosocket");
 	if (ast_audiosocket_init(svc, id)) {
 		return -1;
 	}
 
+	int retval;
+	int error = 0;
+	int heartbeat;
+	socklen_t len = sizeof (error);
 	chanName = ast_channel_name(chan);
+	usleep(AUDIOPROCESS_USLEEP);
 
+	ast_verb(2, "processing audio stream");
 	while (1) {
 		struct ast_channel *targetChan;
 		int ms = 0;
 		int outfd = 0;
 		struct ast_frame *f;
 
-		targetChan = ast_waitfor_nandfds(&chan, 1, &svc, 1, NULL, &outfd, &ms);
+		retval = getsockopt (svc, SOL_SOCKET, SO_ERROR, &error, &len);
 
+		if (retval != 0) {
+			ast_verb(4, "error getting audio socket error code");
+			return -1;
+		}
+
+		if (error != 0) {
+			//ast_verb(4, "socket error: %s\n", strerror(error));
+			// connection may have been closed
+			return -1;
+		}
+
+		heartbeat = ast_audiosocket_heartbeat(svc);
+		if (heartbeat != 0) {
+			ast_verb(4, "no heartbeat response. Closing connection\n");
+			break;
+		}
+		if (ast_channel_state(chan) != AST_STATE_UP) {
+			ast_verb(2, "channel is no longer online, exiting.");
+			break;
+		}
+		targetChan = ast_waitfor_nandfds(&chan, 1, &svc, 1, NULL, &outfd, &ms);
 		ast_channel_lock(chan);
 		if (targetChan) {
 			f = ast_read(chan);
@@ -242,14 +290,12 @@ static int audiosocket_run(struct ast_channel *chan, const char *id, int svc)
 
 			if (f->frametype == AST_FRAME_VOICE) {
 				/* Send audio frame to audiosocket */
-				/*
 				if (ast_audiosocket_send_frame(svc, f)) {
 					ast_log(LOG_ERROR, "Failed to forward channel frame from %s to AudioSocket\n",
 						chanName);
 					ast_frfree(f);
 					return -1;
 				}
-				*/
 			}
 			ast_frfree(f);
 		}
@@ -269,6 +315,7 @@ static int audiosocket_run(struct ast_channel *chan, const char *id, int svc)
 			ast_frfree(f);
 		}
 		ast_channel_unlock(chan);
+		usleep(AUDIOPROCESS_USLEEP);
 	}
 	return 0;
 }
