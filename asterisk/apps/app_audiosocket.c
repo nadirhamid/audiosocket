@@ -379,6 +379,12 @@ static int audiosocket_run(struct ast_channel *chan, struct audiosocket_data *au
 		return -1;
 	}
 
+	int recvRetries;
+	int writeRetries;
+	int recvCounter = 0;
+	int writeCounter = 0;
+	recvRetries = 3;
+	writeRetries = 3;
 	chanName = ast_channel_name(chan);
 	ast_verb(2, "audiosocket_run was called");
 	ast_mutex_lock(&audiosocket_data->audiosocket_ds->lock);
@@ -388,79 +394,11 @@ static int audiosocket_run(struct ast_channel *chan, struct audiosocket_data *au
 	//ast_audiohook_lock(&audiosocket_data->audiohook);
 	while (audiosocket_data->audiohook.status == AST_AUDIOHOOK_STATUS_RUNNING) {
 		struct ast_channel *targetChan;
-		int ms = 0;
-		int outfd = 0;
-		struct ast_frame *sockfr;
-
-		/*
-		struct ast_frame *fr = ast_audiohook_read_frame(&audiosocket_data->audiohook, audiosocket_data->samples_per_frame, audiosocket_data->direction, format_slin);
-
-		if (!fr) {
-			ast_audiohook_trigger_wait(&audiosocket_data->audiohook);
-
-			if (audiosocket_data->audiohook.status != AST_AUDIOHOOK_STATUS_RUNNING) {
-				ast_verb(2, "<%s> [Audiosocket] AST_AUDIOHOOK_STATUS_RUNNING = 0\n", ast_channel_name(audiosocket_data->autochan->chan));
-				break;
-			}
-
-			continue;
-		}
-
-		//ast_audiohook_unlock(&audiosocket_data->audiohook);
-		if (fr->frametype == AST_FRAME_VOICE) {
-			// Send audio frame to audiosocket
-			ast_verb(4, "sending audio frame\n");
-			struct ast_frame *cur;
-
-			ast_mutex_lock(&audiosocket_data->audiosocket_ds->lock);
-			for (cur = fr; cur; cur = AST_LIST_NEXT(cur, frame_list)) {
-				if (ast_audiosocket_send_frame(svc, fr)) {
-					ast_log(LOG_ERROR, "Failed to forward channel frame from %s to AudioSocket\n",
-						chanName);
-					return -1;
-				}
-			}
-			ast_mutex_unlock(&audiosocket_data->audiosocket_ds->lock);
-		}
-		if (fr) {
-			ast_frame_free(fr, 0);
-		}
-		*/
-
-		// read from Audiosocket
-		if (outfd >= 0) {
-			ast_mutex_lock(&audiosocket_data->audiosocket_ds->lock);
-			//ast_audiohook_lock(&audiosocket_data->audiohook);
-			sockfr = ast_audiosocket_receive_frame(svc);
-			if (!sockfr) {
-				ast_log(LOG_ERROR, "Failed to receive frame from AudioSocket message for"
-					"channel %s\n", chanName);
-				continue;
-			}
-			//ast_audiohook_write_list(chan, ast_channel_audiohooks(chan), AST_AUDIOHOOK_DIRECTION_WRITE, sockfr);
-			if (ast_write(chan, sockfr)) {
-				ast_log(LOG_WARNING, "Failed to forward frame to channel %s\n", chanName);
-				ast_frfree(sockfr);
-				continue;
-			}
-
-			ast_frfree(sockfr);
-			//ast_audiohook_unlock(&audiosocket_data->audiohook);
-			ast_mutex_unlock(&audiosocket_data->audiosocket_ds->lock);
-		}
-
-		//ast_audiohook_lock(&audiosocket_data->audiohook);
-	}
-
-
-/*
-	while (1) {
-		struct ast_channel *targetChan;
-		int ms = 0;
+		int ms = 5000;
 		int outfd = 0;
 		struct ast_frame *f;
 
-		continue;
+		/*
 		targetChan = ast_waitfor_nandfds(&chan, 1, &svc, 1, NULL, &outfd, &ms);
 		if (targetChan) {
 			f = ast_read(chan);
@@ -479,23 +417,41 @@ static int audiosocket_run(struct ast_channel *chan, struct audiosocket_data *au
 			}
 			ast_frfree(f);
 		}
+		*/
 
 		if (outfd >= 0) {
 			f = ast_audiosocket_receive_frame(svc);
 			if (!f) {
 				ast_log(LOG_ERROR, "Failed to receive frame from AudioSocket message for"
 					"channel %s\n", chanName);
-				return -1;
+				if ( recvCounter >= recvRetries ) {
+					break;
+				} else {
+					recvCounter++;
+				}
+			} else {
+				recvCounter = 0;
 			}
 			if (ast_write(chan, f)) {
-				ast_log(LOG_WARNING, "Failed to forward frame to channel %s\n", chanName);
-				ast_frfree(f);
-				return -1;
+				//ast_log(LOG_WARNING, "Failed to forward frame to channel %s\n", chanName);
+				if ( writeCounter >= writeRetries ) {
+					ast_frfree(f);
+					break;
+				} else {
+					writeCounter++;
+				}
+			} else {
+				writeCounter = 0;
 			}
+
 			ast_frfree(f);
 		}
+
+
+		//ast_audiohook_lock(&audiosocket_data->audiohook);
 	}
-	*/
+
+	ast_verb(4, "Closing audiosocket connection\n");
 	return 0;
 }
 
