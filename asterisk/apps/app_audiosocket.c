@@ -398,26 +398,9 @@ static int audiosocket_run(struct ast_channel *chan, struct audiosocket_data *au
 		int outfd = 0;
 		struct ast_frame *f;
 
-		/*
-		targetChan = ast_waitfor_nandfds(&chan, 1, &svc, 1, NULL, &outfd, &ms);
-		if (targetChan) {
-			f = ast_read(chan);
-			if (!f) {
-				return -1;
-			}
-
-			if (f->frametype == AST_FRAME_VOICE) {
-				// Send audio frame to audiosocket
-				if (ast_audiosocket_send_frame(svc, f)) {
-					ast_log(LOG_ERROR, "Failed to forward channel frame from %s to AudioSocket\n",
-						chanName);
-					ast_frfree(f);
-					return -1;
-				}
-			}
-			ast_frfree(f);
+		if (!chan || ast_channel_state(chan) != AST_STATE_UP) {
+			break;
 		}
-		*/
 
 		if (outfd >= 0) {
 			f = ast_audiosocket_receive_frame(svc);
