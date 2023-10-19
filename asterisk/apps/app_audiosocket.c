@@ -172,20 +172,6 @@ static int setup_audiosocket_ds(struct audiosocket_data *audiosocket_data, struc
 	return 0;
 }
 
-static void destroy_monitor_audiohook(struct audiosocket_data *audiosocket_data)
-{
-	if (audiosocket_data->audiosocket_ds) {
-		ast_mutex_lock(&audiosocket_data->audiosocket_ds->lock);
-		audiosocket_data->audiosocket_ds->audiohook = NULL;
-		ast_mutex_unlock(&audiosocket_data->audiosocket_ds->lock);
-	}
-	/* kill the audiohook. */
-	ast_audiohook_lock(&audiosocket_data->audiohook);
-	ast_audiohook_detach(&audiosocket_data->audiohook);
-	ast_audiohook_unlock(&audiosocket_data->audiohook);
-	ast_audiohook_destroy(&audiosocket_data->audiohook);
-}
-
 static int start_audiohook(struct ast_channel *chan, struct ast_audiohook *audiohook)
 {
 	if (!chan) {
@@ -365,6 +351,20 @@ static int audiosocket_exec(struct ast_channel *chan, const char *data)
 	return 0;
 }
 
+static void destroy_monitor_audiohook(struct audiosocket_data *audiosocket_data)
+{
+	if (audiosocket_data->audiosocket_ds) {
+		ast_mutex_lock(&audiosocket_data->audiosocket_ds->lock);
+		audiosocket_data->audiosocket_ds->audiohook = NULL;
+		ast_mutex_unlock(&audiosocket_data->audiosocket_ds->lock);
+	}
+	/* kill the audiohook. */
+	ast_audiohook_lock(&audiosocket_data->audiohook);
+	ast_audiohook_detach(&audiosocket_data->audiohook);
+	ast_audiohook_unlock(&audiosocket_data->audiohook);
+	ast_audiohook_destroy(&audiosocket_data->audiohook);
+}
+
 static int audiosocket_run(struct ast_channel *chan, struct audiosocket_data *audiosocket_data, int svc)
 {
 	const char *chanName;
@@ -435,6 +435,13 @@ static int audiosocket_run(struct ast_channel *chan, struct audiosocket_data *au
 	}
 
 	ast_verb(4, "Closing audiosocket connection\n");
+	ast_audiohook_unlock(&audiosocket_data->audiohook);
+	destroy_monitor_audiohook(audiosocket_data);
+	ast_autochan_destroy(audiosocket_data->autochan);
+	audiosocket_free(audiosocket_data);
+	audiosocket_free(audiosocket_data);
+	ast_verb(4, "Closed connection successfully\n");
+
 	return 0;
 }
 
