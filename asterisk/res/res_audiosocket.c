@@ -28,6 +28,10 @@
 	<support_level>extended</support_level>
  ***/
 
+#ifndef AST_MODULE
+#define AST_MODULE "AudioSocket"
+#endif
+
 #include "asterisk.h"
 #include "errno.h"
 #include <uuid/uuid.h>
