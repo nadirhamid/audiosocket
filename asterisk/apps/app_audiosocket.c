@@ -118,7 +118,7 @@ static const struct ast_datastore_info audiosocket_ds_info = {
 	.destroy = audiosocket_ds_destroy,
 };
 
-static int audiosocket_run(struct ast_channel *chan, struct audiosocket_data *audiosocket_data, const int svc);
+static int audiosocket_run(struct ast_channel *chan, struct audiosocket_data *audiosocket_data, int svc, struct ast_format* writeFormat, struct ast_format* readFormat);
 
 static void audiosocket_destroy(void *data)
 {
@@ -247,35 +247,15 @@ static void *audiosocket_thread(void *obj)
 	}
 
 	ast_verb(2, "setup audiosocket ds successfully. server = %s direction = %d\n", audiosocket_data->server, audiosocket_data->direction);
-	res = audiosocket_run(chan, audiosocket_data, s);
+	res = audiosocket_run(chan, audiosocket_data, s, writeFormat, readFormat);
 	/* On non-zero return, report failure */
 	if (res) {
-		/* Restore previous formats and close the connection */
-		if (ast_set_write_format(chan, writeFormat)) {
-			ast_log(LOG_ERROR, "Failed to restore write format for channel %s\n", chanName);
-		}
-		if (ast_set_read_format(chan, readFormat)) {
-			ast_log(LOG_ERROR, "Failed to restore read format for channel %s\n", chanName);
-		}
-		ao2_ref(writeFormat, -1);
-		ao2_ref(readFormat, -1);
-		close(s);
 		return res;
 	}
+
 	close(s);
 
-	if (ast_set_write_format(chan, writeFormat)) {
-		ast_log(LOG_ERROR, "Failed to restore write format for channel %s\n", chanName);
-	}
-	if (ast_set_read_format(chan, readFormat)) {
-		ast_log(LOG_ERROR, "Failed to restore read format for channel %s\n", chanName);
-	}
-	ao2_ref(writeFormat, -1);
-	ao2_ref(readFormat, -1);
-
 	return 0;
-
-	return NULL;
 }
 
 static int launch_audiosocket_thread(struct ast_channel *chan, char* server, char* idStr) {
@@ -365,7 +345,7 @@ static void destroy_monitor_audiohook(struct audiosocket_data *audiosocket_data)
 	ast_audiohook_destroy(&audiosocket_data->audiohook);
 }
 
-static int audiosocket_run(struct ast_channel *chan, struct audiosocket_data *audiosocket_data, int svc)
+static int audiosocket_run(struct ast_channel *chan, struct audiosocket_data *audiosocket_data, int svc, struct ast_format* writeFormat, struct ast_format* readFormat)
 {
 	const char *chanName;
 	struct ast_format *format_slin;
@@ -434,13 +414,24 @@ static int audiosocket_run(struct ast_channel *chan, struct audiosocket_data *au
 		//ast_audiohook_lock(&audiosocket_data->audiohook);
 	}
 
+	/* Restore previous formats and close the connection */
+	if (ast_set_write_format(chan, writeFormat)) {
+		ast_log(LOG_ERROR, "Failed to restore write format for channel %s\n", chanName);
+	}
+	if (ast_set_read_format(chan, readFormat)) {
+		ast_log(LOG_ERROR, "Failed to restore read format for channel %s\n", chanName);
+	}
+	ao2_ref(writeFormat, -1);
+	ao2_ref(readFormat, -1);
+	close(svc);
+
 	ast_verb(4, "Closing audiosocket connection\n");
 	ast_audiohook_unlock(&audiosocket_data->audiohook);
 	destroy_monitor_audiohook(audiosocket_data);
 	ast_autochan_destroy(audiosocket_data->autochan);
-	audiosocket_free(audiosocket_data);
-	audiosocket_free(audiosocket_data);
+	//audiosocket_free(audiosocket_data);
 	ast_verb(4, "Closed connection successfully\n");
+	//ast_module_unref(ast_module_info->self);
 
 	return 0;
 }
